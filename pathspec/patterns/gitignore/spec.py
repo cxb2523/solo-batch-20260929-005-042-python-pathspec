@@ -6,9 +6,28 @@ appears to contradict the documentation. Git discards patterns with invalid
 range notation. This is used by :class:`~pathspec.gitignore.GitIgnoreSpec` to
 fully replicate Git's handling.
 
+The compile chain is split into components, each in its own module:
+
+- :mod:`pathspec.patterns.gitignore._normalize` normalizes the pattern
+(negation prefix, trailing slash, anchoring and root-relative segments,
+``**`` segments).
+
+- :mod:`pathspec.patterns.gitignore._fragments` assembles the regular
+expression parts from the normalized segments.
+
+- :mod:`pathspec.patterns.gitignore._compile` compiles the regular expression
+and forwards matching to it.
+
+- :mod:`pathspec.patterns.gitignore._cache` is the thread-safe regex cache
+used by the compilation component.
+
 .. _`gitignore`: https://git-scm.com/docs/gitignore
 """
 
+import re
+from collections.abc import (
+	Iterable,
+	Iterator)
 from typing import (
 	Literal,
 	Optional)  # Replaced by `X | None` in 3.10.
@@ -17,39 +36,34 @@ from pathspec._typing import (
 	AnyStr,  # Removed in 3.18.
 	assert_unreachable,
 	override)  # Added in 3.12.
+from pathspec.pattern import (
+	RegexMatchResult)
 
+from . import (
+	_compile)
 from .base import (
 	GitIgnorePatternError,
 	_BYTES_ENCODING,
 	_GitIgnoreBasePattern,
 	_PosixClassError,
 	_RangeNotationError,
-	_TrailingBackslashError,
-	_strip_trailing_ws)
+	_TrailingBackslashError)
+from ._fragments import (
+	_DIR_MARK,
+	_DIR_MARK_CG,
+	_DIR_MARK_OPT,
+	_MATCH_ALL,
+	build_regex_parts)
+from ._normalize import (
+	NormalizedPattern,
+	normalize_pattern)
 
-_DIR_MARK = 'ps_d'
-"""
-The regex group name for the directory marker. This is only used by
-:class:`GitIgnoreSpec`.
-"""
-
-_DIR_MARK_CG = f'(?P<{_DIR_MARK}>/)'
-"""
-This regular expression matches the directory marker.
-"""
-
-_DIR_MARK_OPT = f'(?:{_DIR_MARK_CG}|$)'
-"""
-This regular expression matches the optional directory marker and sub-path.
-"""
-
-_MATCH_ALL = f'^(?s:.+/)?[^/]+{_DIR_MARK_OPT}'
-"""
-This regular expression matches every path. It is the expansion of the patterns
-"*" and "**" (i.e., "**/{any name}"), and it has to capture the directory marker
-like any other pattern so that :class:`.GitIgnoreSpec` can tell a directory
-match from a file match.
-"""
+# Re-exported from `._fragments` for backward compatibility. These names have
+# always been importable from this module (used by the "hyperscan" and "re2"
+# backends, the benchmarks, and the tests).
+__all__ = [
+	'GitIgnoreSpecPattern',
+]
 
 
 class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
@@ -65,103 +79,44 @@ class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
 	# Keep the dict-less class hierarchy.
 	__slots__ = ()
 
-	@staticmethod
-	def __normalize_segments(
-		is_dir_pattern: bool,
-		pattern_segs: list[str],
-	) -> tuple[Optional[list[str]], Optional[str]]:
+	@override
+	@classmethod
+	def _compile_regex(cls, raw_regex: AnyStr) -> re.Pattern:
 		"""
-		Normalize the pattern segments to make processing easier.
-
-		*is_dir_pattern* (:class:`bool`) is whether the pattern is a directory
-		pattern (i.e., ends with a slash '/').
-
-		*pattern_segs* (:class:`list` of :class:`str`) contains the pattern
-		segments. This may be modified in place.
-
-		Raises :exc:`ValueError` if the pattern normalizes to nothing.
-
-		Returns a :class:`tuple` containing either:
-
-		- The normalized segments (:class:`list` of :class:`str`; or :data:`None`).
-
-		- The regular expression override (:class:`str` or :data:`None`).
+		Compile the regular expression through the regex cache component
+		(:mod:`pathspec.patterns.gitignore._compile`) so repeated patterns are
+		compiled at most once, process-wide and thread-safe.
 		"""
-		if not pattern_segs[0]:
-			# A pattern beginning with a slash ('/') should match relative to the root
-			# directory. Remove the empty first segment to make the pattern relative
-			# to root.
-			del pattern_segs[0]
+		return _compile.compile_regex(raw_regex)
 
-		elif len(pattern_segs) == 1 or (len(pattern_segs) == 2 and not pattern_segs[1]):
-			# A single segment pattern with or without a trailing slash ('/') will
-			# match any descendant path. This is equivalent to "**/{pattern}". Prepend
-			# a double-asterisk segment to make the pattern relative to root.
-			if pattern_segs[0] != '**':
-				pattern_segs.insert(0, '**')
+	@override
+	def match_file(self, file: AnyStr) -> Optional[RegexMatchResult]:
+		"""
+		Matches this pattern against the specified file. This only forwards to
+		the matching component
+		(:func:`pathspec.patterns.gitignore._compile.match_file`).
 
-		else:
-			# A pattern without a beginning slash ('/') but contains at least one
-			# prepended directory (e.g., "dir/{pattern}") should match relative to the
-			# root directory. No segment modification is needed.
-			pass
+		*file* (:class:`str` or :class:`bytes`) is the file path relative to the
+		root directory (e.g., "relative/path/to/file").
 
-		if not pattern_segs:
-			# After normalization, we end up with no pattern at all. This must be
-			# because the pattern is invalid.
-			raise ValueError("Pattern normalized to nothing.")
+		Returns the match result (:class:`.RegexMatchResult`) if *file* matched;
+		otherwise, :data:`None`.
+		"""
+		return _compile.match_file(self.regex, file)
 
-		if not pattern_segs[-1]:
-			# A pattern ending with a slash ('/') will match all descendant paths if
-			# it is a directory but not if it is a regular file. This is equivalent to
-			# "{pattern}/**". Set the empty last segment to a double-asterisk to
-			# include all descendants.
-			pattern_segs[-1] = '**'
+	def match_files(self, files: Iterable[AnyStr]) -> Iterator[AnyStr]:
+		"""
+		Matches this pattern against each of the specified files. This only
+		forwards to the matching component
+		(:func:`pathspec.patterns.gitignore._compile.match_files`).
 
-		# EDGE CASE: Collapse duplicate double-asterisk sequences (i.e., '**/**').
-		# Iterate over the segments in reverse order and remove the duplicate double
-		# asterisks as we go.
-		for i in range(len(pattern_segs) - 1, 0, -1):
-			prev = pattern_segs[i-1]
-			seg = pattern_segs[i]
-			if prev == '**' and seg == '**':
-				del pattern_segs[i]
+		*files* (:class:`~collections.abc.Iterable` of :class:`str`) contains
+		each file relative to the root directory.
 
-		seg_count = len(pattern_segs)
-		if seg_count == 1 and pattern_segs[0] == '**':
-			if is_dir_pattern:
-				# The pattern "**/" will be normalized to "**", but it should match
-				# everything except for files in the root. Special case this pattern.
-				return (None, _DIR_MARK_CG)
-			else:
-				# The pattern "**" will match every path. Special case this pattern.
-				return (None, _MATCH_ALL)
-
-		elif (
-			seg_count == 2
-			and pattern_segs[0] == '**'
-			and pattern_segs[1] == '*'
-		):
-			# The pattern "*" will be normalized to "**/*" and will match every
-			# path. Special case this pattern for efficiency.
-			return (None, _MATCH_ALL)
-
-		elif (
-			seg_count == 3
-			and pattern_segs[0] == '**'
-			and pattern_segs[1] == '*'
-			and pattern_segs[2] == '**'
-		):
-			# The pattern "*/" will be normalized to "**/*/**" which will match every
-			# file not in the root directory. Special case this pattern for
-			# efficiency.
-			if is_dir_pattern:
-				return (None, _DIR_MARK_CG)
-			else:
-				return (None, '/')
-
-		# No regular expression override, return modified pattern segments.
-		return (pattern_segs, None)
+		Returns an :class:`~collections.abc.Iterator` yielding each matched file
+		path (:class:`str`).
+		"""
+		return _compile.match_files(self.regex, files)
 
 	@override
 	@classmethod
@@ -172,7 +127,11 @@ class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
 		errors: Optional[Literal['literal', 'null', 'raise']] = None,
 	) -> tuple[Optional[AnyStr], Optional[bool]]:
 		"""
-		Convert the pattern into a regular expression.
+		Convert the pattern into a regular expression. This composes the
+		normalization component
+		(:func:`pathspec.patterns.gitignore._normalize.normalize_pattern`) with
+		the fragment assembly component
+		(:func:`pathspec.patterns.gitignore._fragments.build_regex_parts`).
 
 		*pattern* (:class:`str` or :class:`bytes`) is the pattern to convert into a
 		regular expression.
@@ -226,64 +185,33 @@ class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
 		else:
 			assert_unreachable(f"Failed to map {errors=!r} to seg_errors.")
 
-		# Strip trailing whitespace.
-		pattern_str = _strip_trailing_ws(pattern_str)
-
-		regex: Optional[str]
-		include: Optional[bool]
-
-		if pattern_str.startswith('#'):
-			# A pattern starting with a hash ('#') serves as a comment (neither
-			# includes nor excludes files). Escape the hash with a backslash to match
-			# a literal hash (i.e., '\#').
-			return (None, None)
-
-		elif pattern_str == '/':
-			# EDGE CASE: According to `git check-ignore` (v2.4.1), a single '/' does
-			# not match any file.
-			return (None, None)
-
-		if pattern_str.startswith('!'):
-			# A pattern starting with an exclamation mark ('!') negates the pattern
-			# (exclude instead of include). Escape the exclamation mark with a
-			# backslash to match a literal exclamation mark (i.e., '\!').
-			include = False
-			# Remove leading exclamation mark.
-			pattern_str = pattern_str[1:]
-		else:
-			include = True
-
-		if not pattern_str:
-			# A blank pattern is a null-operation (neither includes nor excludes
-			# files).
-			return (None, None)
-
-		# Split pattern into segments.
-		orig_segs = pattern_str.split('/')
-
-		# Check whether the pattern is specifically a directory pattern before
-		# normalization.
-		is_dir_pattern = not orig_segs[-1]
-
-		# Normalize pattern to make processing easier.
+		# Normalize the pattern (component 1: negation prefix, trailing slash,
+		# anchoring, root-relative and "**" segments).
 		try:
-			pattern_segs, override_regex = cls.__normalize_segments(
-				is_dir_pattern, orig_segs,
-			)
+			norm: NormalizedPattern = normalize_pattern(pattern_str)
 		except ValueError as e:
 			raise GitIgnorePatternError((
 				f"Invalid git pattern: {original_pattern!r}"
 			)) from e  # GitIgnorePatternError
 
-		if override_regex is not None:
-			# Use regex override.
-			regex = override_regex
+		if norm.include is None:
+			# A null-operation (comment, blank, or "/") neither includes nor
+			# excludes files.
+			return (None, None)
 
-		elif pattern_segs is not None:
-			# Build regular expression from pattern.
+		include = norm.include
+
+		regex: Optional[str]
+		if norm.regex_override is not None:
+			# Use regex override.
+			regex = norm.regex_override
+
+		elif norm.segments is not None:
+			# Build regular expression from pattern (component 2: fragment
+			# assembly).
 			try:
-				regex_parts = cls.__translate_segments(
-					seg_errors, is_dir_pattern, pattern_segs,
+				regex_parts = build_regex_parts(
+					seg_errors, norm.is_dir_pattern, norm.segments,
 				)
 			except (_PosixClassError, _RangeNotationError) as e:
 				if errors == 'raise':
@@ -306,7 +234,7 @@ class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
 
 		else:
 			assert_unreachable((
-				f"{override_regex=} and {pattern_segs=} cannot both be null."
+				f"{norm.regex_override=} and {norm.segments=} cannot both be null."
 			))  # assert_unreachable
 
 		# Encode regex if needed.
@@ -318,91 +246,3 @@ class GitIgnoreSpecPattern(_GitIgnoreBasePattern):
 			out_regex = regex  # type: ignore[assignment]
 
 		return (out_regex, include)
-
-	@classmethod
-	def __translate_segments(
-		cls,
-		errors: Literal['literal', 'raise'],
-		is_dir_pattern: bool,
-		pattern_segs: list[str],
-	) -> list[str]:
-		"""
-		Translate the pattern segments to regular expressions.
-
-		*errors* (:class:`str`) is how to handle invalid pattern notation in the
-		pattern:
-
-		-	``'literal'``: Invalid notation will be treated as a literal string.
-
-		-	``'raise'``: Invalid notation will raise an exception.
-
-		*is_dir_pattern* (:class:`bool`) is whether the pattern is a directory
-		pattern (i.e., ends with a slash '/').
-
-		*pattern_segs* (:class:`list` of :class:`str`) contains the pattern
-		segments.
-
-		Raises :exc:`._PosixClassError` when an invalid POXIS class is found and
-		*errors* is ``'literal'``.
-
-		Raises :exc:`._RangeNotationError` when an invalid range notation is found
-		and *errors* is ``'literal'``.
-
-		Raises :exc:`._TrailingBackslashError` when a trailing backslash is found at
-		the end of the pattern, regardless of the value of *errors*.
-
-		Returns the regular expression parts (:class:`list` of :class:`str`).
-		"""
-		# Build regular expression from pattern.
-		out_parts = []
-		need_slash = False
-		end = len(pattern_segs) - 1
-		for i, seg in enumerate(pattern_segs):
-			if seg == '**':
-				if i == 0:
-					# A normalized pattern beginning with double-asterisks ('**') will
-					# match any leading path segments.
-					out_parts.append('^(?s:.+/)?')
-
-				elif i < end:
-					# A pattern with inner double-asterisks ('**') will match multiple (or
-					# zero) inner path segments.
-					out_parts.append('(?s:/.+)?')
-					need_slash = True
-
-				else:
-					assert i == end, (i, end)
-					# A normalized pattern ending with double-asterisks ('**') will match
-					# nonempty trailing path segments, not the parent directory itself.
-					if is_dir_pattern:
-						out_parts.append(_DIR_MARK_CG)
-					else:
-						out_parts.append('/[^/]')
-
-			else:
-				# Match path segment.
-				if i == 0:
-					# Anchor to root directory.
-					out_parts.append('^')
-
-				if need_slash:
-					out_parts.append('/')
-
-				if seg == '*':
-					# Match whole path segment.
-					out_parts.append('[^/]+')
-
-				else:
-					# Match segment glob pattern.
-					# - EDGE CASE: Git discards patterns with invalid range notation.
-					out_parts.append(cls._translate_segment_glob(seg, errors))
-
-				if i == end:
-					# A pattern ending without a slash ('/') will match a file or a
-					# directory (with paths underneath it). E.g., "foo" matches "foo",
-					# "foo/bar", "foo/bar/baz", etc.
-					out_parts.append(_DIR_MARK_OPT)
-
-				need_slash = True
-
-		return out_parts

@@ -133,7 +133,7 @@ class RegexPattern(Pattern):
 				assert raw_regex is not None, (
 					f"{raw_regex=!r} must be non-null when {include=!r} is not None."
 				)
-				regex = re.compile(raw_regex)
+				regex = self._compile_regex(raw_regex)
 
 		elif pattern is not None and hasattr(pattern, 'match'):
 			# Assume pattern is a precompiled regular expression.
@@ -163,6 +163,23 @@ class RegexPattern(Pattern):
 		*regex* (:class:`re.Pattern` or :data:`None`) is the compiled regular
 		expression for the pattern.
 		"""
+
+	@classmethod
+	def _compile_regex(cls, raw_regex: AnyStr) -> re.Pattern:
+		"""
+		.. warning:: This method is not part of the public API. It is subject to
+			change.
+
+		Compile the regular expression. The default defers to :func:`re.compile`.
+		Subclasses may override this to route compilation through a cache (see
+		:mod:`pathspec.patterns.gitignore._compile`).
+
+		*raw_regex* (:class:`str` or :class:`bytes`) is the uncompiled regular
+		expression.
+
+		Returns the compiled regex (:class:`re.Pattern`).
+		"""
+		return re.compile(raw_regex)
 
 	def __repr__(self) -> str:
 		"""
