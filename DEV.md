@@ -143,3 +143,16 @@ Review the following PyPI packages.
 
 - v1.37.1 (latest as of 2025-10-20) requires Python 3.9+.
 - [yamllint on Wheelodex](https://www.wheelodex.org/projects/yamllint/).
+
+Development Tools
+-----------------
+
+### dev/serve.py
+
+Read-only local server to inspect the GitWildMatch compile pipeline
+(normalization, anchor flags, regex fragments, compile counts)::
+
+	python dev/serve.py [port]
+
+Open http://127.0.0.1:<port>/ in a browser. The pipeline components live in
+``pathspec/patterns/_gitwildmatch/`` (normalize, regex, compile, cache).
